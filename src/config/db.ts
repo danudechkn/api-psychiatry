@@ -12,10 +12,10 @@ const sequelize = new Sequelize(
   process.env.DB_USER as string, // root
   process.env.DB_PASS as string, // (ว่าง)
   {
-    host: process.env.DB_HOST || "127.0.0.1",
+    host: process.env.DB_HOST,
     dialect: dbDialect, // มั่นใจได้ว่าค่าเป็นข้อมูลประเภท Dialect แน่นอน
-    port: Number(process.env.DB_PORT) || 3306, // แปลงค่า string จาก env เป็นตัวเลข (number)
-    logging: true, // ปิด log query
+    port: Number(process.env.DB_PORT || process.env.PORTPPK || 3308), // พอร์ตฐานข้อมูล PPKHOSP (3308)
+    logging: false,
   },
 );
 
