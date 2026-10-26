@@ -1,5 +1,5 @@
 import db from "../../models/ppkhosp/index";
-import { Op } from "sequelize";
+import { Op, QueryTypes } from "sequelize";
 import { DateUtil } from "../../utils/date.util";
 
 export interface PsychiatryRateData {
@@ -37,22 +37,29 @@ export class PsychiatryrateService {
         periodStartStr: string,
         periodEndStr: string
     ): number {
-        const admitDateStr = this.formatDate(admitdatetime);
+        const admitDateStr = typeof admitdatetime === "string" && admitdatetime.length === 10
+            ? admitdatetime
+            : this.formatDate(admitdatetime);
+
         const hasValidDischarge =
             dischargedatetime &&
-            !isNaN(new Date(dischargedatetime).getTime()) &&
-            new Date(dischargedatetime).getFullYear() > 1970;
+            (typeof dischargedatetime === "string" ? dischargedatetime.length >= 10 : (
+                !isNaN(new Date(dischargedatetime).getTime()) &&
+                new Date(dischargedatetime).getFullYear() > 1970
+            ));
 
         const dischDateStr = hasValidDischarge
-            ? this.formatDate(dischargedatetime!)
+            ? (typeof dischargedatetime === "string" && dischargedatetime.length === 10
+                ? dischargedatetime
+                : this.formatDate(dischargedatetime!))
             : null;
 
         // อยู่นอกช่วงการประเมิน
         if (dischDateStr && dischDateStr < periodStartStr) return 0;
         if (admitDateStr > periodEndStr) return 0;
 
-        // Safeguard: ป้องกันผู้ป่วยในอดีตที่ลืมกดจำหน่ายในระบบ (dischargedatetime เป็น null นานเกิน 90 วัน)
-        if (!hasValidDischarge && this.diffInDays(admitDateStr, periodStartStr) > 90) {
+        // Safeguard: ป้องกันผู้ป่วยในอดีตที่ลืมกดจำหน่ายในระบบ (dischargedatetime เป็น null นานเกิน 60 วัน)
+        if (!hasValidDischarge && this.diffInDays(admitDateStr, periodStartStr) > 60) {
             return 0;
         }
 
@@ -113,44 +120,7 @@ export class PsychiatryrateService {
                 });
             }
 
-            const wardCondition = {
-                [Op.or]: [
-                    { tolocationid: String(targetLocationId) },
-                    { dischlocationid: String(targetLocationId) },
-                ],
-            };
-
-            // 1. ค้นหาช่วงวันแรกสุดและวันล่าสุดที่มีการ admit ผู้ป่วยจิตเวชในฐานข้อมูล
-            const earliest = await db.pat_admit.findOne({
-                where: {
-                    ...wardCondition,
-                    admitdatetime: {
-                        [Op.and]: [
-                            { [Op.ne]: null },
-                            { [Op.gt]: new Date("1990-01-01") },
-                        ],
-                    },
-                },
-                order: [["admitdatetime", "ASC"]],
-                attributes: ["admitdatetime"],
-                raw: true,
-            });
-
-            const latest = await db.pat_admit.findOne({
-                where: {
-                    ...wardCondition,
-                    admitdatetime: {
-                        [Op.and]: [
-                            { [Op.ne]: null },
-                            { [Op.gt]: new Date("1990-01-01") },
-                        ],
-                    },
-                },
-                order: [["admitdatetime", "DESC"]],
-                attributes: ["admitdatetime", "dischargedatetime"],
-                raw: true,
-            });
-
+            // 1. กำหนดช่วงเดือนเป้าหมาย (ค่าเริ่มต้น 12 เดือน)
             const targetMonths: { year: number; month: number }[] = [];
             const now = new Date();
 
@@ -162,7 +132,7 @@ export class PsychiatryrateService {
                 });
             }
 
-            // 2. ดึงข้อมูล pat_admit ทั้งหมดครอบคลุมช่วงเวลา 12 เดือนใน Query เดียว
+            // 2. ดึงข้อมูลการครองเตียงเฉพาะที่เกิดขึ้นในวอร์ดจาก ipd_reg ครอบคลุมช่วงเวลาใน Query เดียว
             const firstMonth = targetMonths[0];
             const lastMonth = targetMonths[targetMonths.length - 1];
             const overallStart = `${firstMonth.year}-${String(firstMonth.month).padStart(2, "0")}-01`;
@@ -172,20 +142,36 @@ export class PsychiatryrateService {
             const overallStartDateTime = new Date(`${overallStart}T00:00:00.000`);
             const overallEndDateTime = new Date(`${overallEnd}T23:59:59.999`);
 
-            const admissions = await db.pat_admit.findAll({
-                where: {
-                    admitdatetime: {
-                        [Op.lte]: overallEndDateTime,
+            // ดึงข้อมูลการครองเตียงเฉพาะที่เกิดขึ้นจริงในวอร์ดจิตเวชจาก ipd_reg เชื่อมกับ pat_admit
+            const admissions = (await db.sequelize.query(
+                `
+                SELECT 
+                    r.an,
+                    r.hn,
+                    DATE_FORMAT(r.startdatetime, '%Y-%m-%d') AS admitdatetime,
+                    DATE_FORMAT(COALESCE(r.enddatetime, a.dischargedatetime), '%Y-%m-%d') AS dischargedatetime
+                FROM ipd_reg r
+                INNER JOIN pat_admit a ON r.an = a.an
+                WHERE r.locationid = :targetLocationId
+                  AND (r.flag_status IS NULL OR r.flag_status != 'C')
+                  AND (a.flag_cancel IS NULL OR a.flag_cancel != 'Y')
+                  AND (a.admitdoctorid IS NOT NULL)
+                  AND r.startdatetime <= :overallEndDateTime
+                  AND (
+                      COALESCE(r.enddatetime, a.dischargedatetime) IS NULL 
+                      OR COALESCE(r.enddatetime, a.dischargedatetime) >= :overallStartDateTime
+                  )
+                ORDER BY r.startdatetime ASC
+                `,
+                {
+                    replacements: {
+                        targetLocationId,
+                        overallStartDateTime,
+                        overallEndDateTime,
                     },
-                    [Op.or]: [
-                        { dischargedatetime: null },
-                        { dischargedatetime: { [Op.gte]: overallStartDateTime } },
-                    ],
-                    [Op.and]: [wardCondition],
-                },
-                attributes: ["an", "hn", "admitdatetime", "dischargedatetime"],
-                raw: true,
-            });
+                    type: QueryTypes.SELECT,
+                }
+            )) as Array<{ an: string; hn: string; admitdatetime: string; dischargedatetime: string | null }>;
 
             const results: PsychiatryRateData[] = [];
 

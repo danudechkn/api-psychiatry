@@ -128,6 +128,7 @@ export class PsychiatrybedService {
                     SELECT id, hn, an, patvisitid, patregid, icdcode, diagtype, opdipd
                     FROM pat_diag
                     WHERE (${diagConditions.join(" OR ")})
+                    AND opdipd = 'O'
                     ORDER BY (CASE WHEN diagtype = 1 THEN 0 ELSE 1 END), diagtype ASC, id ASC
                     `,
                     {
