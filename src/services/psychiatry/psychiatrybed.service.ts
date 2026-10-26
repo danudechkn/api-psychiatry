@@ -1,5 +1,6 @@
 import db from "../../models/ppkhosp/index";
 import { QueryTypes } from "sequelize";
+import { DateUtil } from "../../utils/date.util";
 
 export interface PsychiatryBedData {
     bedName: string;          // รหัสหรือชื่อเตียง (เช่น PN01 หรือ 01)
@@ -20,45 +21,6 @@ export interface PsychiatryBedData {
 }
 
 export class PsychiatrybedService {
-    /**
-     * คำนวณอายุ ปี เดือน วัน จากวันเดือนปีเกิด
-     */
-    private static calculateAge(birthDate: Date | string | null | undefined): {
-        age_y: number;
-        age_m: number;
-        age_d: number;
-    } {
-        if (!birthDate) {
-            return { age_y: 0, age_m: 0, age_d: 0 };
-        }
-
-        const birth = new Date(birthDate);
-        if (isNaN(birth.getTime())) {
-            return { age_y: 0, age_m: 0, age_d: 0 };
-        }
-
-        const today = new Date();
-        let years = today.getFullYear() - birth.getFullYear();
-        let months = today.getMonth() - birth.getMonth();
-        let days = today.getDate() - birth.getDate();
-
-        if (days < 0) {
-            months -= 1;
-            const prevMonth = new Date(today.getFullYear(), today.getMonth(), 0);
-            days += prevMonth.getDate();
-        }
-
-        if (months < 0) {
-            years -= 1;
-            months += 12;
-        }
-
-        return {
-            age_y: Math.max(0, years),
-            age_m: Math.max(0, months),
-            age_d: Math.max(0, days),
-        };
-    }
 
     /**
      * ดึงข้อมูลสถานะเตียงผู้ป่วยจิตเวช พร้อมข้อมูลการวินิจฉัยโรค (pdx, dx0-dx5), เพศ และอายุ
@@ -67,8 +29,6 @@ export class PsychiatrybedService {
         try {
             // รหัสวอร์ดจิตเวช (ค่าเริ่มต้น 4090 หรือจาก PSYCHIATRY_WARD_ID ใน .env)
             const targetLocationId =
-                query?.ward ||
-                query?.wardId ||
                 query?.locationid ||
                 process.env.PSYCHIATRY_WARD_ID ||
                 "4090";
@@ -254,7 +214,7 @@ export class PsychiatrybedService {
                 const sex = b.sex != null ? String(b.sex) : "";
 
                 // อายุ
-                const { age_y, age_m, age_d } = this.calculateAge(b.birthdatetime);
+                const { age_y, age_m, age_d } = DateUtil.calculateAge(b.birthdatetime);
 
                 return {
                     bedName,

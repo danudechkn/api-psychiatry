@@ -1,5 +1,6 @@
 import db from "../../models/ppkhosp/index";
 import { Op } from "sequelize";
+import { DateUtil } from "../../utils/date.util";
 
 export interface PsychiatryRateData {
     month: string;              // Format: "YYYY-MM" (เดือน)
@@ -16,20 +17,14 @@ export class PsychiatryrateService {
      * คำนวณผลต่างจำนวนวันตามปฏิทินระหว่างวันที่สองวัน (รูปแบบ YYYY-MM-DD)
      */
     private static diffInDays(startDateStr: string, endDateStr: string): number {
-        const d1 = new Date(`${startDateStr}T00:00:00Z`).getTime();
-        const d2 = new Date(`${endDateStr}T00:00:00Z`).getTime();
-        return Math.round((d2 - d1) / (1000 * 60 * 60 * 24));
+        return DateUtil.diffInDays(startDateStr, endDateStr);
     }
 
     /**
      * แปลง Date หรือ string ให้อยู่ในรูป 'YYYY-MM-DD'
      */
     private static formatDate(d: Date | string): string {
-        const dateObj = new Date(d);
-        const year = dateObj.getFullYear();
-        const month = String(dateObj.getMonth() + 1).padStart(2, "0");
-        const day = String(dateObj.getDate()).padStart(2, "0");
-        return `${year}-${month}-${day}`;
+        return DateUtil.formatDate(d);
     }
 
     /**
@@ -93,7 +88,6 @@ export class PsychiatryrateService {
             // รหัสวอร์ดจิตเวช (ค่าเริ่มต้น 4090 หรือจาก PSYCHIATRY_WARD_ID ใน .env)
             const targetLocationId =
                 query?.locationid ||
-                query?.wardId ||
                 process.env.PSYCHIATRY_WARD_ID ||
                 "4090";
 
@@ -272,8 +266,7 @@ export class PsychiatryrateService {
 
             const targetUrl =
                 options.targetUrl ||
-                process.env.EXTERNAL_BED_OCCUPANCY_URL ||
-                process.env.EXTERNAL_API_URL;
+                process.env.EXTERNAL_BED_OCCUPANCY_URL
 
             if (!targetUrl) {
                 // หากยังไม่มีการกำหนด URL ปลายทาง ให้คืนค่า payload ที่เตรียมไว้พร้อมแจ้งเตือน
