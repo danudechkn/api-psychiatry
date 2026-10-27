@@ -1,6 +1,7 @@
 import db from "../../models/ppkhosp/index";
 import { QueryTypes } from "sequelize";
 import { DateUtil } from "../../utils/date.util";
+import { LoggerUtil } from "../../utils/logger.util";
 
 export interface PsychiatryBedData {
     bedName: string;          // รหัสหรือชื่อเตียง (เช่น PN01 หรือ 01)
@@ -18,6 +19,21 @@ export interface PsychiatryBedData {
     age_y: number;            // อายุปี
     age_m: number;            // อายุเดือน
     age_d: number;            // อายุวัน
+}
+
+export interface SendPsychBedReportOptions {
+    targetUrl?: string;
+    query?: Record<string, any>;
+    sendType?: string;
+    timeoutMs?: number;
+}
+
+export interface SendPsychBedReportResult {
+    success: boolean;
+    status: number;
+    message: string;
+    sentPayload: { beds: PsychiatryBedData[]; sendType: string };
+    response?: any;
 }
 
 export class PsychiatrybedService {
@@ -58,6 +74,7 @@ export class PsychiatrybedService {
                     b.locationid,
                     b.bedno,
                     b.roomno,
+                    b.bedtype,
                     b.ipdregid,
                     b.flag_active,
                     b.bedno_beddiagram,
@@ -84,6 +101,7 @@ export class PsychiatrybedService {
                     ON r.hn = p.hn
                 WHERE b.locationid = :targetLocationId
                   AND (b.flag_active = 'Y' OR b.flag_active IS NULL OR b.flag_active = '')
+                  AND b.bedtype = 'A'
                 ORDER BY b.bedno ASC
                 `,
                 {
@@ -235,7 +253,6 @@ export class PsychiatrybedService {
                     age_d,
                 };
             });
-
             return results;
         } catch (error) {
             console.error("Error in PsychiatrybedService.getPsychiatrybed:", error);
@@ -247,58 +264,118 @@ export class PsychiatrybedService {
      * ส่งรายงานสถานะเตียงจิตเวชไปยัง PBMS API ผ่าน HTTP POST /api/v1/psych-bed/report
      * ตามสเปก ReportBedDto: { beds: [...], sendType: "REST API" }
      */
-    static async sendPsychBedReport(options: {
-        targetUrl?: string;
-        query?: Record<string, any>;
-        sendType?: string;
-    } = {}): Promise<{
-        success: boolean;
-        status: number;
-        message: string;
-        sentPayload: { beds: PsychiatryBedData[]; sendType: string };
-        response?: any;
-    }> {
+    static async sendPsychBedReport(
+        options: SendPsychBedReportOptions = {}
+    ): Promise<SendPsychBedReportResult> {
+        const targetUrl = options.targetUrl || process.env.EXTERNAL_PSYCH_BED_REPORT_URL;
+        const sendType = options.sendType || "REST API";
+        const timeoutMs = options.timeoutMs ?? 15000;
+        let payload: { beds: PsychiatryBedData[]; sendType: string } = { beds: [], sendType };
+
         try {
+            // 1. ตรวจสอบ Target URL ก่อน (Fail-fast ป้องกันการ query DB หากไม่มี URL ปลายทาง)
+            if (!targetUrl) {
+                const message = "Missing targetUrl: please provide targetUrl or set EXTERNAL_PSYCH_BED_REPORT_URL in .env";
+                const result: SendPsychBedReportResult = {
+                    success: false,
+                    status: 400,
+                    message,
+                    sentPayload: payload,
+                };
+
+                LoggerUtil.writeApiLog({
+                    service: "PsychiatrybedService",
+                    action: "sendPsychBedReport",
+                    targetUrl: "",
+                    success: false,
+                    status: 400,
+                    message,
+                    sentPayload: payload,
+                });
+
+                return result;
+            }
+
+            // 2. ดึงข้อมูลสถานะเตียงและจัดเตรียม Payload
             const beds = await this.getPsychiatrybed(options.query || {});
-            const payload = {
-                beds,
-                sendType: options.sendType || "REST API",
-            };
+            payload = { beds, sendType };
 
-            const targetUrl =
-                options.targetUrl ||
-                process.env.EXTERNAL_PSYCH_BED_REPORT_URL ||
-                "https://pbms.jvsk.go.th/api/v1/psych-bed/report";
-
+            // 3. เตรียม Authentication Headers
             const clientId = process.env.CLIENT_ID || process.env.ClIENT_ID || "";
             const secretKey = process.env.SECRET_KEY || "";
 
-            const response = await fetch(targetUrl, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-client-id": clientId,
-                    "x-secret-key": secretKey,
-                },
-                body: JSON.stringify(payload),
-            });
+            // 4. ส่ง HTTP POST พร้อม Timeout Control ป้องกัน Request ค้าง
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+            let response: Response;
+            try {
+                response = await fetch(targetUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-client-id": clientId,
+                        "x-secret-key": secretKey,
+                    },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal,
+                });
+            } finally {
+                clearTimeout(timer);
+            }
+
+            // 5. อ่าน Response จากปลายทาง
             const resData = await response.json().catch(() => null);
+            const isSuccess = response.ok;
 
-            return {
-                success: response.ok || response.status === 201,
+            const result: SendPsychBedReportResult = {
+                success: isSuccess,
                 status: response.status,
-                message: response.ok || response.status === 201
+                message: isSuccess
                     ? "Successfully sent psych bed report to PBMS API"
                     : `PBMS API responded with status ${response.status}`,
                 sentPayload: payload,
                 response: resData,
             };
+
+            // 6. บันทึก Audit Log
+            LoggerUtil.writeApiLog({
+                service: "PsychiatrybedService",
+                action: "sendPsychBedReport",
+                targetUrl,
+                success: result.success,
+                status: result.status,
+                message: result.message,
+                sentPayload: payload,
+                response: resData,
+            });
+
+            return result;
         } catch (error: any) {
             console.error("Error in PsychiatrybedService.sendPsychBedReport:", error);
-            throw error;
+
+            const isTimeout = error?.name === "AbortError";
+            const message = isTimeout
+                ? `Request timed out after ${timeoutMs}ms`
+                : (error?.message || "Internal server error");
+
+            LoggerUtil.writeApiLog({
+                service: "PsychiatrybedService",
+                action: "sendPsychBedReport",
+                targetUrl: targetUrl || "",
+                success: false,
+                status: isTimeout ? 408 : 500,
+                message,
+                sentPayload: payload,
+                error: error?.stack || error,
+            });
+            return {
+                success: false,
+                status: isTimeout ? 408 : 500,
+                message,
+                sentPayload: payload,
+                response: error?.response || null,
+            };
         }
     }
 }
-
-export default PsychiatrybedService;

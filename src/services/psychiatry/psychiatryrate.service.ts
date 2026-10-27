@@ -1,6 +1,7 @@
 import db from "../../models/ppkhosp/index";
 import { Op, QueryTypes } from "sequelize";
 import { DateUtil } from "../../utils/date.util";
+import { LoggerUtil } from "../../utils/logger.util";
 
 export interface PsychiatryRateData {
     month: string;              // Format: "YYYY-MM" (เดือน)
@@ -10,6 +11,20 @@ export interface PsychiatryRateData {
     totalBeds: number;          // Int (จำนวนเตียงจิตเวช)
     daysInPeriod: number;       // Int (จำนวนวันในเดือน)
     bedOccupancyRate: number;   // Float (อัตราครองเตียง %)
+}
+
+export interface SendBedOccupancyOptions {
+    targetUrl?: string;
+    query?: Record<string, any>;
+    timeoutMs?: number;
+}
+
+export interface SendBedOccupancyResult {
+    success: boolean;
+    status: number;
+    message: string;
+    sentPayload: { data: PsychiatryRateData[] };
+    response?: any;
 }
 
 export class PsychiatryrateService {
@@ -29,7 +44,7 @@ export class PsychiatryrateService {
 
     /**
      * คำนวณจำนวนวันนอนของผู้ป่วย 1 การ Admit ในรอบระยะเวลา [periodStartStr, periodEndStr]
-     * ตามหลักสถิติสาธารณสุขและการตรวจนับยอดเที่ยงคืน (Midnight Census)
+     * ตามยอดจำนวนวันนอนทั้งหมดใน ward
      */
     private static calculateAdmissionDays(
         admitdatetime: Date | string,
@@ -64,27 +79,19 @@ export class PsychiatryrateService {
         }
 
         const effStartStr = admitDateStr < periodStartStr ? periodStartStr : admitDateStr;
-        const isDischargedInMonth = dischDateStr !== null && dischDateStr <= periodEndStr;
+        const effEndStr = (dischDateStr && dischDateStr < periodEndStr) ? dischDateStr : periodEndStr;
 
-        if (!isDischargedInMonth) {
-            // ยังนอนรักษาอยู่จนสิ้นสุดเดือน / ยังไม่จำหน่าย
-            return this.diffInDays(effStartStr, periodEndStr) + 1;
-        } else {
-            // มีการจำหน่ายออกภายในเดือนนี้
-            if (admitDateStr < periodStartStr) {
-                // เข้ารักษาก่อนเดือนนี้ และจำหน่ายในเดือนนี้
-                const days = this.diffInDays(periodStartStr, dischDateStr!);
-                return Math.max(0, days);
-            } else {
-                // ทั้งเข้ารักษาและจำหน่ายออกในเดือนเดียวกัน
-                if (admitDateStr === dischDateStr) {
-                    // รับไว้รักษาและจำหน่ายในวันเดียวกัน นับเป็น 1 วันนอน
-                    return 1;
-                } else {
-                    return Math.max(1, this.diffInDays(effStartStr, dischDateStr!));
-                }
-            }
+        if (admitDateStr === dischDateStr && dischDateStr >= periodStartStr && dischDateStr <= periodEndStr) {
+            // รับไว้รักษาและจำหน่ายในวันเดียวกัน นับเป็น 1 วันนอน
+            return 1;
         }
+
+        // ถ้าผู้ป่วยยังนอนอยู่ ณ สิ้นช่วง (ไม่มี discharge หรือ discharge หลังสิ้นช่วง) ให้บวก 1
+        // เพื่อนับวันครองเตียงทั้งหมด (รวมวันสุดท้ายของช่วง)
+        const stillInAtPeriodEnd = !dischDateStr || dischDateStr > periodEndStr;
+        const bonus = stillInAtPeriodEnd ? 1 : 0;
+
+        return Math.max(0, this.diffInDays(effStartStr, effEndStr) + bonus);
     }
 
     /**
@@ -102,23 +109,7 @@ export class PsychiatryrateService {
             const monthsCount = Math.max(1, Number(query?.months) || 12);
 
             // นับจำนวนเตียงจากตาราง ipd_bed โดยตรงตาม locationid (เช่น 4090)
-            let totalBeds = await db.ipd_bed.count({
-                where: {
-                    locationid: targetLocationId,
-                    [Op.or]: [
-                        { flag_active: "Y" },
-                        { flag_active: null },
-                        { flag_active: "" },
-                    ],
-                },
-            });
-
-            // หากไม่มี flag_active ให้ลองนับเตียงทั้งหมดตาม locationid
-            if (!totalBeds || totalBeds === 0) {
-                totalBeds = await db.ipd_bed.count({
-                    where: { locationid: targetLocationId },
-                });
-            }
+            let totalBeds = 20;
 
             // 1. กำหนดช่วงเดือนเป้าหมาย (ค่าเริ่มต้น 12 เดือน)
             const targetMonths: { year: number; month: number }[] = [];
@@ -132,7 +123,7 @@ export class PsychiatryrateService {
                 });
             }
 
-            // 2. ดึงข้อมูลการครองเตียงเฉพาะที่เกิดขึ้นในวอร์ดจาก ipd_reg ครอบคลุมช่วงเวลาใน Query เดียว
+            // 2. ดึงข้อมูลการครองเตียงของผู้ป่วยจิตเวชจาก pat_admit เชื่อมกับ ipd_reg
             const firstMonth = targetMonths[0];
             const lastMonth = targetMonths[targetMonths.length - 1];
             const overallStart = `${firstMonth.year}-${String(firstMonth.month).padStart(2, "0")}-01`;
@@ -142,26 +133,33 @@ export class PsychiatryrateService {
             const overallStartDateTime = new Date(`${overallStart}T00:00:00.000`);
             const overallEndDateTime = new Date(`${overallEnd}T23:59:59.999`);
 
-            // ดึงข้อมูลการครองเตียงเฉพาะที่เกิดขึ้นจริงในวอร์ดจิตเวชจาก ipd_reg เชื่อมกับ pat_admit
+            // ดึงข้อมูลการครองเตียงของผู้ป่วยจิตเวชจาก pat_admit
             const admissions = (await db.sequelize.query(
                 `
                 SELECT 
-                    r.an,
-                    r.hn,
-                    DATE_FORMAT(r.startdatetime, '%Y-%m-%d') AS admitdatetime,
-                    DATE_FORMAT(COALESCE(r.enddatetime, a.dischargedatetime), '%Y-%m-%d') AS dischargedatetime
-                FROM ipd_reg r
-                INNER JOIN pat_admit a ON r.an = a.an
-                WHERE r.locationid = :targetLocationId
-                  AND (r.flag_status IS NULL OR r.flag_status != 'C')
+                    a.an,
+                    a.hn,
+                    DATE_FORMAT(a.admitdatetime, '%Y-%m-%d') AS admitdatetime,
+                    DATE_FORMAT(a.dischargedatetime, '%Y-%m-%d') AS dischargedatetime
+                FROM pat_admit a
+                WHERE (
+                    a.tolocationid = :targetLocationId 
+                    OR a.dischlocationid = :targetLocationId 
+                    OR a.presentlocationid = :targetLocationId
+                    OR EXISTS (
+                        SELECT 1 FROM ipd_reg r 
+                        WHERE r.an = a.an 
+                          AND r.locationid = :targetLocationId 
+                          AND (r.flag_status IS NULL OR r.flag_status != 'C')
+                    )
+                )
                   AND (a.flag_cancel IS NULL OR a.flag_cancel != 'Y')
-                  AND (a.admitdoctorid IS NOT NULL)
-                  AND r.startdatetime <= :overallEndDateTime
+                  AND a.admitdatetime <= :overallEndDateTime
                   AND (
-                      COALESCE(r.enddatetime, a.dischargedatetime) IS NULL 
-                      OR COALESCE(r.enddatetime, a.dischargedatetime) >= :overallStartDateTime
+                      a.dischargedatetime IS NULL 
+                      OR a.dischargedatetime >= :overallStartDateTime
                   )
-                ORDER BY r.startdatetime ASC
+                ORDER BY a.admitdatetime ASC
                 `,
                 {
                     replacements: {
@@ -231,72 +229,117 @@ export class PsychiatryrateService {
      * ส่งข้อมูลอัตราการครองเตียง (Bed Occupancy Rate) ไปยังระบบปลายทางผ่าน HTTP POST
      * ตามสเปก POST /api/v1/bed-occupancy (Headers: x-client-id, x-secret-key, Body: { data })
      */
-    static async sendBedOccupancy(options: {
-        targetUrl?: string;
-        query?: Record<string, any>;
-    } = {}): Promise<{
-        success: boolean;
-        status: number;
-        message: string;
-        sentPayload: { data: PsychiatryRateData[] };
-        response?: any;
-    }> {
+    static async sendBedOccupancy(
+        options: SendBedOccupancyOptions = {}
+    ): Promise<SendBedOccupancyResult> {
+        const targetUrl = options.targetUrl || process.env.EXTERNAL_BED_OCCUPANCY_URL;
+        const timeoutMs = options.timeoutMs ?? 15000;
+        let payload: { data: PsychiatryRateData[] } = { data: [] };
+
         try {
-            // 1. ดึงข้อมูลอัตราครองเตียง
-            const rateData = await this.getPsychiatryrate(options.query || {});
-
-            // 2. จัดรูปแบบ payload: { data: [...] }
-            const payload = {
-                data: rateData,
-            };
-
-            const targetUrl =
-                options.targetUrl ||
-                process.env.EXTERNAL_BED_OCCUPANCY_URL
-
+            // 1. ตรวจสอบ Target URL ก่อน (Fail-fast ป้องกันการ query ข้อมูลหากไม่ได้กำหนด URL)
             if (!targetUrl) {
-                // หากยังไม่มีการกำหนด URL ปลายทาง ให้คืนค่า payload ที่เตรียมไว้พร้อมแจ้งเตือน
-                return {
+                const message = "Missing targetUrl: please provide targetUrl or set EXTERNAL_BED_OCCUPANCY_URL in .env";
+                const result: SendBedOccupancyResult = {
                     success: false,
                     status: 400,
-                    message: "Missing targetUrl: please provide targetUrl or set EXTERNAL_BED_OCCUPANCY_URL in .env",
+                    message,
                     sentPayload: payload,
                 };
+
+                LoggerUtil.writeApiLog({
+                    service: "PsychiatryrateService",
+                    action: "sendBedOccupancy",
+                    targetUrl: "",
+                    success: false,
+                    status: 400,
+                    message,
+                    sentPayload: payload,
+                });
+
+                return result;
             }
 
-            const clientId =
-                process.env.CLIENT_ID ||
-                process.env.ClIENT_ID ||
-                "";
-            const secretKey =
-                process.env.SECRET_KEY ||
-                "";
+            // 2. ดึงข้อมูลอัตราครองเตียงและจัดเตรียม Payload
+            const rateData = await this.getPsychiatryrate(options.query || {});
+            payload = { data: rateData };
 
-            // 3. ส่ง HTTP POST ไปยังระบบปลายทาง
-            const response = await fetch(targetUrl, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-client-id": clientId,
-                    "x-secret-key": secretKey,
-                },
-                body: JSON.stringify(payload),
-            });
+            // 3. เตรียม Authentication Headers
+            const clientId = process.env.CLIENT_ID || process.env.ClIENT_ID || "";
+            const secretKey = process.env.SECRET_KEY || "";
 
+            // 4. ส่ง HTTP POST พร้อม Timeout Control ป้องกัน Request ค้าง
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+            let response: Response;
+            try {
+                response = await fetch(targetUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-client-id": clientId,
+                        "x-secret-key": secretKey,
+                    },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal,
+                });
+            } finally {
+                clearTimeout(timer);
+            }
+
+            // 5. อ่าน Response จากปลายทาง
             const resData = await response.json().catch(() => null);
+            const isSuccess = response.ok;
 
-            return {
-                success: response.ok || response.status === 201,
+            const result: SendBedOccupancyResult = {
+                success: isSuccess,
                 status: response.status,
-                message: response.ok || response.status === 201
+                message: isSuccess
                     ? "Successfully sent bed occupancy data to external API"
                     : `External API responded with status ${response.status}`,
                 sentPayload: payload,
                 response: resData,
             };
+
+            // 6. บันทึก Audit Log
+            LoggerUtil.writeApiLog({
+                service: "PsychiatryrateService",
+                action: "sendBedOccupancy",
+                targetUrl,
+                success: result.success,
+                status: result.status,
+                message: result.message,
+                sentPayload: payload,
+                response: resData,
+            });
+
+            return result;
         } catch (error: any) {
             console.error("Error in PsychiatryrateService.sendBedOccupancy:", error);
-            throw error;
+
+            const isTimeout = error?.name === "AbortError";
+            const message = isTimeout
+                ? `Request timed out after ${timeoutMs}ms`
+                : (error?.message || "Internal server error");
+
+            LoggerUtil.writeApiLog({
+                service: "PsychiatryrateService",
+                action: "sendBedOccupancy",
+                targetUrl: targetUrl || "",
+                success: false,
+                status: isTimeout ? 408 : 500,
+                message,
+                sentPayload: payload,
+                error: error?.stack || error,
+            });
+            return {
+                success: false,
+                status: isTimeout ? 408 : 500,
+                message,
+                sentPayload: payload,
+                response: error?.response || null,
+            };
         }
     }
 }

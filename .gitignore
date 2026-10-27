@@ -6,6 +6,7 @@ dist/
 
 # log files
 *.log
+logs/
 npm-debug.log*
 
 # dotenv environment variables
